@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/pem"
 	"flag"
 	"fmt"
@@ -63,6 +64,7 @@ var (
 	fourOnly        bool
 	sixOnly         bool
 	maxTime         time.Duration
+	cacert          string
 
 	// number of redirects followed
 	redirectsFollowed int
@@ -86,6 +88,7 @@ func init() {
 	flag.BoolVar(&fourOnly, "4", false, "resolve IPv4 addresses only")
 	flag.BoolVar(&sixOnly, "6", false, "resolve IPv6 addresses only")
 	flag.DurationVar(&maxTime, "m", 0, "maximum time allowed for the transfer")
+	flag.StringVar(&cacert, "cacert", "", "CA certificate to verify peer against (SSL)")
 
 	flag.Usage = usage
 }
@@ -140,6 +143,20 @@ func main() {
 	url := parseURL(args[0])
 
 	visit(url)
+}
+
+// readCACerts - helper function to load additional CA certificates
+func readCACerts(certfile string) (*x509.CertPool, error) {
+	certFileBytes, err := ioutil.ReadFile(certfile)
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to read CA certificate file: %v", err)
+	}
+
+	certPool := x509.NewCertPool()
+	certPool.AppendCertsFromPEM(certFileBytes)
+
+	return certPool, nil
 }
 
 // readClientCert - helper function to read client certificate
@@ -279,11 +296,16 @@ func visit(url *url.URL) {
 		if err != nil {
 			log.Fatal(err)
 		}
+		rootCAs, err := readCACerts(cacert)
+		if err != nil {
+			log.Printf("warning: failed to read CA certificates: %s\n", err)
+		}
 
 		tr.TLSClientConfig = &tls.Config{
 			ServerName:         host,
 			InsecureSkipVerify: insecure,
 			Certificates:       cert,
+			RootCAs:            rootCAs,
 		}
 
 		// Because we create a custom TLSClientConfig, we have to opt-in to HTTP/2.
