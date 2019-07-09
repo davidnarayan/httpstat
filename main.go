@@ -90,6 +90,8 @@ var (
 	maxTime         time.Duration
 	cacert          string
 	jsonOutput      bool
+	numRequests     int
+	requestDelay    time.Duration
 
 	// number of redirects followed
 	redirectsFollowed int
@@ -115,6 +117,8 @@ func init() {
 	flag.DurationVar(&maxTime, "m", 0, "maximum time allowed for the transfer")
 	flag.StringVar(&cacert, "cacert", "", "CA certificate to verify peer against (SSL)")
 	flag.BoolVar(&jsonOutput, "J", false, "use JSON to output results")
+	flag.IntVar(&numRequests, "n", 1, "number of requests")
+	flag.DurationVar(&requestDelay, "w", 3*time.Second, "delay between requests")
 
 	flag.Usage = usage
 }
@@ -273,50 +277,6 @@ func dialContext(network string) func(ctx context.Context, network, addr string)
 func visit(url *url.URL) {
 	req := newRequest(httpMethod, url, postBody)
 
-	var tStart, tDNSStart, tConnectStart, tTLSStart, tConnected, tTTFB time.Time
-	var report Report
-
-	trace := &httptrace.ClientTrace{
-		GetConn:  func(_ string) { tStart = time.Now() },
-		DNSStart: func(_ httptrace.DNSStartInfo) { tDNSStart = time.Now() },
-		DNSDone: func(_ httptrace.DNSDoneInfo) {
-			report.Timing.DNS = msSince(tDNSStart)
-			report.Timing.Lookup = msSince(tStart)
-		},
-		ConnectStart: func(_, _ string) {
-			if tConnectStart.IsZero() {
-				// connecting to IP
-				tConnectStart = time.Now()
-			}
-		},
-		ConnectDone: func(net, addr string, err error) {
-			if err != nil {
-				log.Fatalf("unable to connect to host %v: %v", addr, err)
-			}
-			report.Timing.TCP = msSince(tConnectStart)
-			report.Timing.Connect = msSince(tStart)
-
-			report.Address = addr
-			if !jsonOutput {
-				printf("\n%s%s\n", color.GreenString("Connected to "), color.CyanString(addr))
-			}
-		},
-		TLSHandshakeStart: func() { tTLSStart = time.Now() },
-		TLSHandshakeDone: func(_ tls.ConnectionState, _ error) {
-			report.Timing.TLS = msSince(tTLSStart)
-		},
-		GotConn: func(_ httptrace.GotConnInfo) {
-			tConnected = time.Now()
-			report.Timing.PreTransfer = msSince(tStart)
-		},
-		GotFirstResponseByte: func() {
-			tTTFB = time.Now()
-			report.Timing.Server = msSince(tConnected)
-			report.Timing.StartTransfer = msSince(tStart)
-		},
-	}
-	req = req.WithContext(httptrace.WithClientTrace(context.Background(), trace))
-
 	tr := &http.Transport{
 		Proxy:                 http.ProxyFromEnvironment,
 		MaxIdleConns:          100,
@@ -373,71 +333,121 @@ func visit(url *url.URL) {
 		Timeout: maxTime,
 	}
 
-	resp, err := client.Do(req)
-	if err != nil {
-		log.Fatalf("failed to read response: %v", err)
-	}
+	for i := 0; i < numRequests; i++ {
+		if i > 0 {
+			time.Sleep(requestDelay)
+		}
 
-	bodyMsg := readResponseBody(req, resp)
-	resp.Body.Close()
+		var tStart, tDNSStart, tConnectStart, tTLSStart, tConnected, tTTFB time.Time
+		var report Report
 
-	// after read body
-	report.Timing.Transfer = msSince(tTTFB)
-	report.Timing.Total = msSince(tStart)
+		trace := &httptrace.ClientTrace{
+			GetConn:  func(_ string) { tStart = time.Now() },
+			DNSStart: func(_ httptrace.DNSStartInfo) { tDNSStart = time.Now() },
+			DNSDone: func(_ httptrace.DNSDoneInfo) {
+				report.Timing.DNS = msSince(tDNSStart)
+				report.Timing.Lookup = msSince(tStart)
+			},
+			ConnectStart: func(_, _ string) {
+				if tConnectStart.IsZero() {
+					// connecting to IP
+					tConnectStart = time.Now()
+				}
+			},
+			ConnectDone: func(net, addr string, err error) {
+				if err != nil {
+					log.Fatalf("unable to connect to host %v: %v", addr, err)
+				}
+				report.Timing.TCP = msSince(tConnectStart)
+				report.Timing.Connect = msSince(tStart)
 
-	report.Proto = resp.Proto
-	report.Status = resp.Status
-	report.Header = resp.Header
+				report.Address = addr
+				if !jsonOutput {
+					printf("\n%s%s\n", color.GreenString("Connected to "), color.CyanString(addr))
+				}
+			},
+			TLSHandshakeStart: func() { tTLSStart = time.Now() },
+			TLSHandshakeDone: func(_ tls.ConnectionState, _ error) {
+				report.Timing.TLS = msSince(tTLSStart)
+			},
+			GotConn: func(_ httptrace.GotConnInfo) {
+				tConnected = time.Now()
+				report.Timing.PreTransfer = msSince(tStart)
+			},
+			GotFirstResponseByte: func() {
+				tTTFB = time.Now()
+				report.Timing.Server = msSince(tConnected)
+				report.Timing.StartTransfer = msSince(tStart)
+			},
+		}
+		req = req.WithContext(httptrace.WithClientTrace(context.Background(), trace))
 
-	// print status line and headers
-	if jsonOutput {
-		b, err := json.Marshal(report)
+		resp, err := client.Do(req)
 		if err != nil {
-			log.Fatalf("unable to marshal json report: %v", err)
-		}
-		fmt.Printf("%s\n", b)
-	} else {
-		printf("\n%s%s%s\n", color.GreenString("HTTP"), grayscale(14)("/"), color.CyanString("%d.%d %s", resp.ProtoMajor, resp.ProtoMinor, resp.Status))
-
-		names := make([]string, 0, len(resp.Header))
-		for k := range resp.Header {
-			names = append(names, k)
-		}
-		sort.Sort(headers(names))
-		for _, k := range names {
-			printf("%s %s\n", grayscale(14)(k+":"), color.CyanString(strings.Join(resp.Header[k], ",")))
+			log.Fatalf("failed to read response: %v", err)
 		}
 
-		if bodyMsg != "" {
-			printf("\n%s\n", bodyMsg)
-		}
+		bodyMsg := readResponseBody(req, resp)
+		resp.Body.Close()
 
-		fmt.Println()
+		// after read body
+		report.Timing.Transfer = msSince(tTTFB)
+		report.Timing.Total = msSince(tStart)
 
-		switch url.Scheme {
-		case "https":
-			printTemplate(httpsTemplate, report.Timing)
-		case "http":
-			printTemplate(httpTemplate, report.Timing)
-		}
-	}
+		report.Proto = resp.Proto
+		report.Status = resp.Status
+		report.Header = resp.Header
 
-	if followRedirects && isRedirect(resp) {
-		loc, err := resp.Location()
-		if err != nil {
-			if err == http.ErrNoLocation {
-				// 30x but no Location to follow, give up.
-				return
+		// print status line and headers
+		if jsonOutput {
+			b, err := json.Marshal(report)
+			if err != nil {
+				log.Fatalf("unable to marshal json report: %v", err)
 			}
-			log.Fatalf("unable to follow redirect: %v", err)
+			fmt.Printf("%s\n", b)
+		} else {
+			printf("\n%s%s%s\n", color.GreenString("HTTP"), grayscale(14)("/"), color.CyanString("%d.%d %s", resp.ProtoMajor, resp.ProtoMinor, resp.Status))
+
+			names := make([]string, 0, len(resp.Header))
+			for k := range resp.Header {
+				names = append(names, k)
+			}
+			sort.Sort(headers(names))
+			for _, k := range names {
+				printf("%s %s\n", grayscale(14)(k+":"), color.CyanString(strings.Join(resp.Header[k], ",")))
+			}
+
+			if bodyMsg != "" {
+				printf("\n%s\n", bodyMsg)
+			}
+
+			fmt.Println()
+
+			switch url.Scheme {
+			case "https":
+				printTemplate(httpsTemplate, report.Timing)
+			case "http":
+				printTemplate(httpTemplate, report.Timing)
+			}
 		}
 
-		redirectsFollowed++
-		if redirectsFollowed > maxRedirects {
-			log.Fatalf("maximum number of redirects (%d) followed", maxRedirects)
-		}
+		if followRedirects && isRedirect(resp) {
+			loc, err := resp.Location()
+			if err != nil {
+				if err == http.ErrNoLocation {
+					// 30x but no Location to follow, give up.
+					return
+				}
+				log.Fatalf("unable to follow redirect: %v", err)
+			}
 
-		visit(loc)
+			redirectsFollowed++
+			if redirectsFollowed > maxRedirects {
+				log.Fatalf("maximum number of redirects (%d) followed", maxRedirects)
+			}
+
+			visit(loc)
+		}
 	}
 }
 
